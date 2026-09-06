@@ -1,0 +1,84 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email == 'merilocalbazaar@gmail.com' ||
+        request.auth.token.email == 'silgrak1309@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        (request.auth.token.email != null && request.auth.token.email.matches('.*admin.*'))
+      );
+    }
+
+    // Public readable config / settings
+    match /settings/{settingId} {
+      allow read: if true;
+      allow write: if isAdmin() || isSignedIn();
+    }
+
+    // Categories
+    match /categories/{categoryId} {
+      allow read: if true;
+      allow write: if isAdmin() || isSignedIn();
+    }
+
+    // Locations (States, Districts, Blocks)
+    match /locations/{locationId} {
+      allow read: if true;
+      allow write: if isAdmin() || isSignedIn();
+    }
+
+    // Banners
+    match /banners/{bannerId} {
+      allow read: if true;
+      allow write: if isAdmin() || isSignedIn();
+    }
+
+    // Marketplace Listings
+    match /listings/{listingId} {
+      allow read: if true;
+      allow create: if true;
+      allow update, delete: if true;
+    }
+
+    // Recharge / Payment Requests (Top PRO & Monthly Plans)
+    match /recharge_requests/{requestId} {
+      allow read: if true;
+      allow create: if true;
+      allow update, delete: if true;
+    }
+
+    // Users / Profiles
+    match /users/{userId} {
+      allow read: if true;
+      allow write: if true;
+    }
+
+    // Transactions
+    match /transactions/{transactionId} {
+      allow read: if true;
+      allow write: if true;
+    }
+
+    // Notifications
+    match /notifications/{notificationId} {
+      allow read: if true;
+      allow write: if true;
+    }
+
+    // Test connection doc
+    match /test/{testId} {
+      allow read, write: if true;
+    }
+
+    // Default fallback
+    match /{document=**} {
+      allow read, write: if true;
+    }
+  }
+}
