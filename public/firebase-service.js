@@ -29,7 +29,7 @@
     locations: null,
     transactions: null,
     banners: null,
-    notifications: new Map(),
+    deletedListingIds: new Set(),
     lastFetchTime: {}
   };
 
@@ -90,6 +90,7 @@
       } else if ('arrayValue' in valueObj) {
         const arr = valueObj.arrayValue && valueObj.arrayValue.values ? valueObj.arrayValue.values : [];
         result[key] = arr.map(item => {
+          if (!item) return null;
           if ('stringValue' in item) return item.stringValue;
           if ('integerValue' in item) return parseInt(item.integerValue, 10);
           if ('doubleValue' in item) return parseFloat(item.doubleValue);
@@ -107,7 +108,7 @@
   }
 
   // Generic REST Firestore Request with timeout
-  async function firestoreRequest(path, options = {}, timeoutMs = 4000) {
+  async function firestoreRequest(path, options = {}, timeoutMs = 6000) {
     const url = `${BASE_URL}/${path}${path.includes('?') ? '&' : '?'}key=${FIREBASE_CONFIG.apiKey}`;
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     const timeout = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
@@ -137,18 +138,57 @@
     }
   }
 
+  // Robust Query Collection via :runQuery (bypasses collection listing 403 restrictions)
+  async function fetchCollection(collectionName, timeoutMs = 6000) {
+    const queryUrl = `${BASE_URL}:runQuery?key=${FIREBASE_CONFIG.apiKey}`;
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timeout = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
+    try {
+      const body = {
+        structuredQuery: {
+          from: [{ collectionId: collectionName }]
+        }
+      };
+      const res = await fetch(queryUrl, {
+        method: 'POST',
+        signal: controller ? controller.signal : undefined,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      if (timeout) clearTimeout(timeout);
+      if (!res.ok) {
+        console.warn(`[Firebase] Query ${collectionName} error (${res.status})`);
+        return [];
+      }
+      const data = await res.json();
+      if (!Array.isArray(data)) return [];
+      const list = [];
+      data.forEach(item => {
+        if (item && item.document && item.document.fields) {
+          const id = item.document.name.split('/').pop();
+          const docData = firestoreFieldsToJs(item.document.fields);
+          list.push({ id, ...docData, _createTime: item.document.createTime, _updateTime: item.document.updateTime });
+        }
+      });
+      return list;
+    } catch(err) {
+      if (timeout) clearTimeout(timeout);
+      console.warn(`[Firebase] Query ${collectionName} exception:`, err.message || err);
+      return [];
+    }
+  }
+
   // ----------------------------------------------------
   // 1. SETTINGS (UPI ID, QR Code, Site Info)
   // ----------------------------------------------------
-  async function getSettings() {
-    // 1. Return memory cache or localStorage first
-    if (memoryCache.settings) return memoryCache.settings;
+  async function getSettings(forceFresh = false) {
+    if (!forceFresh && memoryCache.settings) return memoryCache.settings;
     try {
       const local = localStorage.getItem('app_admin_settings');
-      if (local) memoryCache.settings = JSON.parse(local);
+      if (local && !forceFresh) memoryCache.settings = JSON.parse(local);
     } catch(e) {}
 
-    // 2. Fetch fresh from Firestore
     try {
       const data = await firestoreRequest('settings/app_config');
       if (data && data.fields) {
@@ -178,7 +218,6 @@
       window.dispatchEvent(new CustomEvent('app_settings_updated', { detail: updated }));
     }
 
-    // Async write to Firestore
     try {
       const fields = jsToFirestoreFields(updated);
       await firestoreRequest('settings/app_config', {
@@ -193,56 +232,104 @@
   }
 
   // ----------------------------------------------------
-  // 2. LISTINGS (New Post Listing, Top PRO, Boosted)
+  // 2. LISTINGS (New Post Listing, Top PRO, Boosted, Deleted)
   // ----------------------------------------------------
   async function getListings(forceFresh = false) {
     const now = Date.now();
-    if (!forceFresh && memoryCache.listings && (now - (memoryCache.lastFetchTime.listings || 0) < 10000)) {
+    if (!forceFresh && memoryCache.listings && (now - (memoryCache.lastFetchTime.listings || 0) < 5000)) {
       return memoryCache.listings;
     }
 
-    let localList = [];
+    // 1. Fetch Cloud Listings and Cloud Deletions in parallel
+    let cloudList = [];
+    let deletedDocs = [];
     try {
-      const stored = localStorage.getItem('all_cached_listings') || localStorage.getItem('local_listings_override');
-      if (stored) localList = JSON.parse(stored);
+      const [listingsRes, delRes] = await Promise.all([
+        fetchCollection('listings'),
+        fetchCollection('deleted_listings')
+      ]);
+      cloudList = Array.isArray(listingsRes) ? listingsRes : [];
+      deletedDocs = Array.isArray(delRes) ? delRes : [];
+    } catch(err) {
+      console.warn('[Firebase] Listings fetch error:', err);
+    }
+
+    // 2. Build deleted IDs set
+    const deletedSet = new Set();
+    deletedDocs.forEach(d => {
+      if (d && d.id) deletedSet.add(d.id);
+      if (d && d.deleted_id) deletedSet.add(d.deleted_id);
+    });
+    try {
+      const localDel = JSON.parse(localStorage.getItem('deleted_listing_ids') || '[]');
+      localDel.forEach(id => deletedSet.add(id));
     } catch(e) {}
 
-    try {
-      const res = await firestoreRequest('listings?pageSize=300');
-      if (res && res.documents && Array.isArray(res.documents)) {
-        const cloudList = res.documents.map(doc => {
-          const id = doc.name.split('/').pop();
-          const data = firestoreFieldsToJs(doc.fields);
-          return { id, ...data };
-        });
-
-        // Merge cloud with local, avoiding duplicates
-        const map = new Map();
-        localList.forEach(item => { if (item && item.id) map.set(item.id, item); });
-        cloudList.forEach(item => { if (item && item.id) map.set(item.id, { ...(map.get(item.id) || {}), ...item }); });
-
-        const merged = Array.from(map.values()).sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
-        memoryCache.listings = merged;
-        memoryCache.lastFetchTime.listings = now;
-        try { localStorage.setItem('all_cached_listings', JSON.stringify(merged)); } catch(e) {}
-        return merged;
+    // 3. Filter cloud listings (exclude deleted)
+    const activeCloudList = cloudList.filter(item => {
+      if (!item || !item.id) return false;
+      if (deletedSet.has(item.id)) return false;
+      if (item.status === 'deleted' || item.is_deleted === true) {
+        deletedSet.add(item.id);
+        return false;
       }
-    } catch(err) {}
+      return true;
+    });
 
-    return memoryCache.listings || localList;
+    // 4. Clean local storage so stale deleted posts on other devices are permanently purged
+    try {
+      localStorage.setItem('deleted_listing_ids', JSON.stringify(Array.from(deletedSet)));
+      
+      const userCustom = JSON.parse(localStorage.getItem('user_custom_listings') || '[]');
+      const cleanedCustom = userCustom.filter(item => item && item.id && !deletedSet.has(item.id) && item.status !== 'deleted');
+      localStorage.setItem('user_custom_listings', JSON.stringify(cleanedCustom));
+
+      const myCreated = JSON.parse(localStorage.getItem('my_created_listings') || '[]');
+      const cleanedMy = myCreated.filter(item => item && item.id && !deletedSet.has(item.id) && item.status !== 'deleted');
+      localStorage.setItem('my_created_listings', JSON.stringify(cleanedMy));
+    } catch(e) {}
+
+    if (activeCloudList.length > 0 || cloudList.length > 0) {
+      // Sort by creation date descending
+      activeCloudList.sort((a, b) => new Date(b.created_at || b._createTime || 0) - new Date(a.created_at || a._createTime || 0));
+      memoryCache.listings = activeCloudList;
+      memoryCache.lastFetchTime.listings = now;
+      try { localStorage.setItem('all_cached_listings', JSON.stringify(activeCloudList)); } catch(e) {}
+      return activeCloudList;
+    }
+
+    // Fallback if cloud was completely unreachable
+    let fallback = [];
+    try {
+      const stored = localStorage.getItem('all_cached_listings');
+      if (stored) {
+        fallback = JSON.parse(stored).filter(item => item && item.id && !deletedSet.has(item.id));
+      }
+    } catch(e) {}
+    return fallback;
   }
 
   async function saveListing(listingObj) {
     if (!listingObj || !listingObj.id) {
       listingObj = { ...listingObj, id: 'list_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7) };
     }
+    const isPro = Boolean(listingObj.is_featured || listingObj.is_top_pro);
     const cleanListing = {
       ...listingObj,
+      is_featured: isPro,
+      is_top_pro: isPro,
+      status: listingObj.status || 'pending',
       created_at: listingObj.created_at || new Date().toISOString(),
       updated_at: new Date().toISOString()
     };
 
-    // 1. Optimistic Local Update
+    // 1. Remove from deleted sets if re-created
+    try {
+      const deletedIds = JSON.parse(localStorage.getItem('deleted_listing_ids') || '[]').filter(id => id !== cleanListing.id);
+      localStorage.setItem('deleted_listing_ids', JSON.stringify(deletedIds));
+    } catch(e) {}
+
+    // 2. Optimistic Local Update
     let current = memoryCache.listings || [];
     const index = current.findIndex(l => l.id === cleanListing.id);
     if (index >= 0) {
@@ -258,20 +345,27 @@
         myLists.unshift(cleanListing);
         localStorage.setItem('my_created_listings', JSON.stringify(myLists));
       }
+      const userCustom = JSON.parse(localStorage.getItem('user_custom_listings') || '[]');
+      const cIdx = userCustom.findIndex(l => l.id === cleanListing.id);
+      if (cIdx >= 0) userCustom[cIdx] = cleanListing;
+      else userCustom.unshift(cleanListing);
+      localStorage.setItem('user_custom_listings', JSON.stringify(userCustom));
     } catch(e) {}
 
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('listing_created', { detail: cleanListing }));
     }
 
-    // 2. Cloud Firestore Persist
+    // 3. Cloud Firestore Persist
     try {
       const fields = jsToFirestoreFields(cleanListing);
       await firestoreRequest(`listings/${cleanListing.id}`, {
         method: 'PATCH',
         body: JSON.stringify({ fields })
       });
-      console.log('[Firebase] Listing saved to Firestore:', cleanListing.id);
+      // Delete any leftover tombstone in deleted_listings
+      await firestoreRequest(`deleted_listings/${cleanListing.id}`, { method: 'DELETE' });
+      console.log('[Firebase] Listing saved to Firestore across all devices:', cleanListing.id);
     } catch(err) {
       console.warn('[Firebase] Listing cloud save error:', err);
     }
@@ -282,7 +376,16 @@
     if (!id) return;
     let current = memoryCache.listings || [];
     const item = current.find(l => l.id === id) || { id };
-    const updated = { ...item, ...updates, updated_at: new Date().toISOString() };
+    const isPro = (updates && (updates.is_featured !== undefined || updates.is_top_pro !== undefined))
+      ? Boolean(updates.is_featured || updates.is_top_pro)
+      : Boolean(item.is_featured || item.is_top_pro);
+    const updated = {
+      ...item,
+      ...updates,
+      is_featured: isPro,
+      is_top_pro: isPro,
+      updated_at: new Date().toISOString()
+    };
 
     const idx = current.findIndex(l => l.id === id);
     if (idx >= 0) {
@@ -291,7 +394,15 @@
       current.push(updated);
     }
     memoryCache.listings = current;
-    try { localStorage.setItem('all_cached_listings', JSON.stringify(current)); } catch(e) {}
+    try {
+      localStorage.setItem('all_cached_listings', JSON.stringify(current));
+      const userCustom = JSON.parse(localStorage.getItem('user_custom_listings') || '[]');
+      const cIdx = userCustom.findIndex(l => l.id === id);
+      if (cIdx >= 0) {
+        userCustom[cIdx] = { ...userCustom[cIdx], ...updates };
+        localStorage.setItem('user_custom_listings', JSON.stringify(userCustom));
+      }
+    } catch(e) {}
 
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('listing_updated', { detail: updated }));
@@ -303,7 +414,7 @@
         method: 'PATCH',
         body: JSON.stringify({ fields })
       });
-      console.log('[Firebase] Listing updated in Firestore:', id);
+      console.log('[Firebase] Listing updated in Firestore across devices:', id);
     } catch(err) {
       console.warn('[Firebase] Update listing error:', err);
     }
@@ -312,24 +423,46 @@
 
   async function deleteListing(id) {
     if (!id) return;
+    // 1. Remove from in-memory cache and localStorage
     let current = (memoryCache.listings || []).filter(l => l.id !== id);
     memoryCache.listings = current;
     try {
       localStorage.setItem('all_cached_listings', JSON.stringify(current));
+      
       const deletedIds = JSON.parse(localStorage.getItem('deleted_listing_ids') || '[]');
       if (!deletedIds.includes(id)) {
         deletedIds.push(id);
         localStorage.setItem('deleted_listing_ids', JSON.stringify(deletedIds));
       }
+
+      const userCustom = JSON.parse(localStorage.getItem('user_custom_listings') || '[]');
+      localStorage.setItem('user_custom_listings', JSON.stringify(userCustom.filter(l => l && l.id !== id)));
+
+      const myCreated = JSON.parse(localStorage.getItem('my_created_listings') || '[]');
+      localStorage.setItem('my_created_listings', JSON.stringify(myCreated.filter(l => l && l.id !== id)));
     } catch(e) {}
 
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('listing_deleted', { detail: { id } }));
+      window.dispatchEvent(new Event('storage'));
     }
 
+    // 2. Cloud delete & record tombstone in deleted_listings so all other phones purge it immediately
     try {
-      await firestoreRequest(`listings/${id}`, { method: 'DELETE' });
-      console.log('[Firebase] Listing deleted from Firestore:', id);
+      await Promise.all([
+        firestoreRequest(`listings/${id}`, { method: 'DELETE' }),
+        firestoreRequest(`deleted_listings/${id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            fields: jsToFirestoreFields({
+              id,
+              deleted_id: id,
+              deleted_at: new Date().toISOString()
+            })
+          })
+        })
+      ]);
+      console.log('[Firebase] Listing deleted & synced across all phones:', id);
     } catch(err) {
       console.warn('[Firebase] Delete listing error:', err);
     }
@@ -340,36 +473,29 @@
   // ----------------------------------------------------
   async function getRechargeRequests(forceFresh = false) {
     const now = Date.now();
-    if (!forceFresh && memoryCache.recharges && (now - (memoryCache.lastFetchTime.recharges || 0) < 10000)) {
+    if (!forceFresh && memoryCache.recharges && (now - (memoryCache.lastFetchTime.recharges || 0) < 5000)) {
       return memoryCache.recharges;
+    }
+
+    let cloudList = [];
+    try {
+      cloudList = await fetchCollection('recharge_requests');
+    } catch(err) {
+      console.warn('[Firebase] Recharge requests query error:', err);
+    }
+
+    if (Array.isArray(cloudList) && cloudList.length > 0) {
+      cloudList.sort((a, b) => new Date(b.submitted_at || b.created_at || b._createTime || 0) - new Date(a.submitted_at || a.created_at || a._createTime || 0));
+      memoryCache.recharges = cloudList;
+      memoryCache.lastFetchTime.recharges = now;
+      try { localStorage.setItem('all_recharge_requests', JSON.stringify(cloudList)); } catch(e) {}
+      return cloudList;
     }
 
     let localList = [];
     try {
       localList = JSON.parse(localStorage.getItem('all_recharge_requests') || '[]');
     } catch(e) {}
-
-    try {
-      const res = await firestoreRequest('recharge_requests?pageSize=300');
-      if (res && res.documents && Array.isArray(res.documents)) {
-        const cloudList = res.documents.map(doc => {
-          const id = doc.name.split('/').pop();
-          const data = firestoreFieldsToJs(doc.fields);
-          return { id, ...data };
-        });
-
-        const map = new Map();
-        localList.forEach(item => { if (item && (item.id || item.utr)) map.set(item.id || item.utr, item); });
-        cloudList.forEach(item => { if (item && (item.id || item.utr)) map.set(item.id || item.utr, { ...(map.get(item.id || item.utr) || {}), ...item }); });
-
-        const merged = Array.from(map.values()).sort((a, b) => new Date(b.submitted_at || b.created_at || 0) - new Date(a.submitted_at || a.created_at || 0));
-        memoryCache.recharges = merged;
-        memoryCache.lastFetchTime.recharges = now;
-        try { localStorage.setItem('all_recharge_requests', JSON.stringify(merged)); } catch(e) {}
-        return merged;
-      }
-    } catch(err) {}
-
     return memoryCache.recharges || localList;
   }
 
@@ -396,6 +522,7 @@
 
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('recharge_request_created', { detail: cleanReq }));
+      window.dispatchEvent(new Event('storage'));
     }
 
     // 2. Cloud Firestore Persist
@@ -405,7 +532,7 @@
         method: 'PATCH',
         body: JSON.stringify({ fields })
       });
-      console.log('[Firebase] Recharge request saved to Firestore:', id);
+      console.log('[Firebase] Recharge/Top PRO request synced to Firestore for Admin Panel:', id);
     } catch(err) {
       console.warn('[Firebase] Recharge request cloud save error:', err);
     }
@@ -437,11 +564,13 @@
       localStorage.setItem('all_recharge_requests', JSON.stringify(list));
       const overrides = JSON.parse(localStorage.getItem('recharge_status_overrides') || '{}');
       overrides[docId] = { status, ...extra };
+      if (target?.utr) overrides[target.utr] = { status, ...extra };
       localStorage.setItem('recharge_status_overrides', JSON.stringify(overrides));
     } catch(e) {}
 
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('recharge_status_updated', { detail: updated }));
+      window.dispatchEvent(new Event('storage'));
     }
 
     try {
@@ -450,7 +579,7 @@
         method: 'PATCH',
         body: JSON.stringify({ fields })
       });
-      console.log('[Firebase] Recharge status updated in Firestore:', docId, status);
+      console.log('[Firebase] Recharge status updated in Firestore across all phones:', docId, status);
     } catch(err) {
       console.warn('[Firebase] Recharge status update error:', err);
     }
@@ -462,36 +591,24 @@
   // ----------------------------------------------------
   async function getUsers(forceFresh = false) {
     const now = Date.now();
-    if (!forceFresh && memoryCache.users && (now - (memoryCache.lastFetchTime.users || 0) < 10000)) {
+    if (!forceFresh && memoryCache.users && (now - (memoryCache.lastFetchTime.users || 0) < 5000)) {
       return memoryCache.users;
     }
+
+    try {
+      const cloudUsers = await fetchCollection('users');
+      if (Array.isArray(cloudUsers) && cloudUsers.length > 0) {
+        memoryCache.users = cloudUsers;
+        memoryCache.lastFetchTime.users = now;
+        try { localStorage.setItem('admin_users_cache', JSON.stringify(cloudUsers)); } catch(e) {}
+        return cloudUsers;
+      }
+    } catch(err) {}
 
     let localUsers = [];
     try {
       localUsers = JSON.parse(localStorage.getItem('admin_users_cache') || '[]');
     } catch(e) {}
-
-    try {
-      const res = await firestoreRequest('users?pageSize=300');
-      if (res && res.documents && Array.isArray(res.documents)) {
-        const cloudUsers = res.documents.map(doc => {
-          const id = doc.name.split('/').pop();
-          const data = firestoreFieldsToJs(doc.fields);
-          return { id, ...data };
-        });
-
-        const map = new Map();
-        localUsers.forEach(u => { if (u && u.id) map.set(u.id, u); });
-        cloudUsers.forEach(u => { if (u && u.id) map.set(u.id, { ...(map.get(u.id) || {}), ...u }); });
-
-        const merged = Array.from(map.values());
-        memoryCache.users = merged;
-        memoryCache.lastFetchTime.users = now;
-        try { localStorage.setItem('admin_users_cache', JSON.stringify(merged)); } catch(e) {}
-        return merged;
-      }
-    } catch(err) {}
-
     return memoryCache.users || localUsers;
   }
 
@@ -546,27 +663,21 @@
   // ----------------------------------------------------
   // 5. LOCATIONS (India States, Districts, Blocks)
   // ----------------------------------------------------
-  async function getLocations() {
-    if (memoryCache.locations) return memoryCache.locations;
+  async function getLocations(forceFresh = false) {
+    if (!forceFresh && memoryCache.locations) return memoryCache.locations;
+    try {
+      const cloudLocs = await fetchCollection('locations');
+      if (cloudLocs.length > 0) {
+        memoryCache.locations = cloudLocs;
+        try { localStorage.setItem('app_custom_locations', JSON.stringify(cloudLocs)); } catch(e) {}
+        return cloudLocs;
+      }
+    } catch(err) {}
+
     try {
       const local = localStorage.getItem('app_custom_locations');
       if (local) memoryCache.locations = JSON.parse(local);
     } catch(e) {}
-
-    try {
-      const res = await firestoreRequest('locations?pageSize=500');
-      if (res && res.documents && Array.isArray(res.documents)) {
-        const cloudLocs = res.documents.map(doc => {
-          const id = doc.name.split('/').pop();
-          return { id, ...firestoreFieldsToJs(doc.fields) };
-        });
-        if (cloudLocs.length > 0) {
-          memoryCache.locations = cloudLocs;
-          try { localStorage.setItem('app_custom_locations', JSON.stringify(cloudLocs)); } catch(e) {}
-          return cloudLocs;
-        }
-      }
-    } catch(err) {}
 
     return memoryCache.locations || [];
   }
@@ -604,27 +715,21 @@
   // ----------------------------------------------------
   // 6. CATEGORIES
   // ----------------------------------------------------
-  async function getCategories() {
-    if (memoryCache.categories) return memoryCache.categories;
+  async function getCategories(forceFresh = false) {
+    if (!forceFresh && memoryCache.categories) return memoryCache.categories;
+    try {
+      const cloudCats = await fetchCollection('categories');
+      if (cloudCats.length > 0) {
+        memoryCache.categories = cloudCats;
+        try { localStorage.setItem('app_custom_categories', JSON.stringify(cloudCats)); } catch(e) {}
+        return cloudCats;
+      }
+    } catch(err) {}
+
     try {
       const local = localStorage.getItem('app_custom_categories');
       if (local) memoryCache.categories = JSON.parse(local);
     } catch(e) {}
-
-    try {
-      const res = await firestoreRequest('categories?pageSize=200');
-      if (res && res.documents && Array.isArray(res.documents)) {
-        const cloudCats = res.documents.map(doc => {
-          const id = doc.name.split('/').pop();
-          return { id, ...firestoreFieldsToJs(doc.fields) };
-        });
-        if (cloudCats.length > 0) {
-          memoryCache.categories = cloudCats;
-          try { localStorage.setItem('app_custom_categories', JSON.stringify(cloudCats)); } catch(e) {}
-          return cloudCats;
-        }
-      }
-    } catch(err) {}
 
     return memoryCache.categories || [];
   }
@@ -688,26 +793,18 @@
   }
 
   async function getTransactions(userId = null) {
-    let localTxs = [];
-    try { localTxs = JSON.parse(localStorage.getItem('all_transactions') || '[]'); } catch(e) {}
-
     try {
-      const res = await firestoreRequest('transactions?pageSize=300');
-      if (res && res.documents && Array.isArray(res.documents)) {
-        const cloudTxs = res.documents.map(doc => {
-          const id = doc.name.split('/').pop();
-          return { id, ...firestoreFieldsToJs(doc.fields) };
-        });
-        const map = new Map();
-        localTxs.forEach(t => map.set(t.id, t));
-        cloudTxs.forEach(t => map.set(t.id, { ...(map.get(t.id) || {}), ...t }));
-        const merged = Array.from(map.values()).sort((a, b) => new Date(b.created_at || b.date || 0) - new Date(a.created_at || a.date || 0));
-        try { localStorage.setItem('all_transactions', JSON.stringify(merged)); } catch(e) {}
-        if (userId) return merged.filter(t => t.user_id === userId);
-        return merged;
+      const cloudTxs = await fetchCollection('transactions');
+      if (Array.isArray(cloudTxs) && cloudTxs.length > 0) {
+        cloudTxs.sort((a, b) => new Date(b.created_at || b.date || 0) - new Date(a.created_at || a.date || 0));
+        try { localStorage.setItem('all_transactions', JSON.stringify(cloudTxs)); } catch(e) {}
+        if (userId) return cloudTxs.filter(t => t.user_id === userId);
+        return cloudTxs;
       }
     } catch(err) {}
 
+    let localTxs = [];
+    try { localTxs = JSON.parse(localStorage.getItem('all_transactions') || '[]'); } catch(e) {}
     if (userId) return localTxs.filter(t => t.user_id === userId);
     return localTxs;
   }
@@ -744,7 +841,7 @@
   }
 
   // ----------------------------------------------------
-  // 9. MEDIA & FILE UPLOAD (Firebase Storage / WebP compressed)
+  // 9. MEDIA & FILE UPLOAD (Firebase Storage / Base64 Fallback)
   // ----------------------------------------------------
   async function uploadMedia(fileOrBase64, folder) {
     if (!fileOrBase64) return '';
@@ -756,7 +853,6 @@
     const rand = Math.random().toString(36).substring(2, 8);
     const fileName = `${safeFolder}/${timestamp}_${rand}.jpg`;
 
-    // Attempt direct Firebase Storage upload via REST API if possible
     try {
       const bucket = FIREBASE_CONFIG.storageBucket;
       if (bucket) {
@@ -793,11 +889,48 @@
         }
       }
     } catch(err) {
-      console.warn('[Firebase Storage upload error, falling back to secure direct URL]:', err);
+      console.warn('[Firebase Storage upload error, falling back]:', err);
     }
 
-    // Return the base64 / data URL directly as safe robust fallback
     return typeof fileOrBase64 === 'string' ? fileOrBase64 : '';
+  }
+
+  // ----------------------------------------------------
+  // 10. REALTIME AUTO-SYNC BACKGROUND WORKER
+  // Keeps all phones and admin panel 100% updated in real-time
+  // ----------------------------------------------------
+  function startSyncWorker() {
+    let isSyncing = false;
+    async function syncTick() {
+      if (isSyncing) return;
+      if (typeof document !== 'undefined' && document.hidden) return;
+      isSyncing = true;
+      try {
+        await Promise.all([
+          getListings(true),
+          getRechargeRequests(true)
+        ]);
+      } catch(err) {
+      } finally {
+        isSyncing = false;
+      }
+    }
+
+    // Initial sync
+    setTimeout(syncTick, 100);
+
+    // Periodic sync every 8 seconds
+    setInterval(syncTick, 8000);
+
+    // Sync on window focus or visibility change
+    if (typeof window !== 'undefined') {
+      window.addEventListener('focus', () => syncTick());
+      if (typeof document !== 'undefined') {
+        document.addEventListener('visibilitychange', () => {
+          if (!document.hidden) syncTick();
+        });
+      }
+    }
   }
 
   // Expose global FirebaseDB object
@@ -825,11 +958,15 @@
     getTransactions,
     sendNotification,
     uploadMedia,
+    fetchCollection,
     firestoreRequest,
     jsToFirestoreFields,
     firestoreFieldsToJs
   };
 
-  console.log('🔥 [Meri Local Bazaar] Firebase Firestore Database Service Connected!');
+  // Start background real-time sync worker
+  startSyncWorker();
+
+  console.log('🔥 [Meri Local Bazaar] Multi-Device Firebase Firestore Database Connected & Synced!');
 
 })(typeof window !== 'undefined' ? window : this);
